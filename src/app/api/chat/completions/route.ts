@@ -2,8 +2,14 @@ import OpenAI from "openai";
 import { Logger } from "@/utils/logger";
 import { NextRequest, NextResponse } from "next/server";
 import { env } from "@/config/env";
+import { Pinecone } from "@pinecone-database/pinecone";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 
 const logger = new Logger("API:Chat");
+const pinecone = new Pinecone({ apiKey: env.PINECONE_API_KEY });
+const namespace = pinecone.index("company-data").namespace("aven");
+const ai = new GoogleGenerativeAI(env.GOOGLE_API_KEY!);
+const embeddingModel = ai.getGenerativeModel({ model: "gemini-embedding-001" });
 
 const gemini = new OpenAI({
   apiKey: env.GOOGLE_API_KEY,
@@ -19,7 +25,10 @@ export async function POST(req: NextRequest) {
     //first we must await the request
 
     const body = await req.json();
-    logger.info("Received request body:", { hasMessages : !!body.messages, statusCode: 200 });
+    logger.info("Received request body:", {
+      hasMessages: !!body.messages,
+      statusCode: 200,
+    });
     //destructuring the request body
     const {
       model,
@@ -30,25 +39,59 @@ export async function POST(req: NextRequest) {
       call,
       ...restParams
     } = body;
-//Validate required parameters
+    //Validate required parameters
     if (!messages || !Array.isArray(messages) || messages.length === 0) {
-      return NextResponse.json({ error: "Messages array is required and cannot be empty." }, { status: 400 }
+      return NextResponse.json(
+        { error: "Messages array is required and cannot be empty." },
+        { status: 400 }
       );
     }
 
-
     const lastMessage = messages?.[messages.length - 1];
-    if(!lastMessage?.content){
-      return NextResponse.json({ error: "Last message content is required." }, { status: 400 });
+    if (!lastMessage?.content) {
+      return NextResponse.json(
+        { error: "Last message content is required." },
+        { status: 400 }
+      );
     }
 
     logger.info("Creating prompt modification...");
 
-    // Create a prompt modification using Gemini
+    // const pinecone = new Pinecone({ apiKey: env.PINECONE_API_KEY });
+    // const index = pinecone.index("company-data");
+    // const namespace = index.namespace("aven");
+    const query = lastMessage.content;
+
+    logger.info("Query:", query);
+    const embedding = await embeddingModel.embedContent(query);
+    logger.info("Embedding:", embedding);
+    // Search for relevant records in Pinecone
+    const response = await namespace.query({
+      vector: embedding.embedding.values,
+      topK: 2,
+      includeMetadata: true,
+      // includeValues: true,
+    });
+
+    logger.info("Pinecone query response:", response);
+
+    const context = response.matches
+      ?.map(match => match.metadata?.chunk_text)
+      .join("\n");
+
+    logger.info("Context:", context);
+
+    const geminiPrompt = `Answer my question based on the following context:
+    
+    ${context}
+
+    Question: ${query}
+      Answer:`;
+    // Create a prom pt modification using Gemini
     const prompt = await gemini.chat.completions.create({
       model: "gemini-2.0-flash-lite",
       // A list of messages that make up the conversation so far.
-      messages : [
+      messages: [
         {
           role: "user",
 
@@ -58,14 +101,17 @@ export async function POST(req: NextRequest) {
         PROMPT: ${lastMessage.content}
         MODIFIED PROMPT: `,
         },
-        ],
+      ],
       max_tokens: 500,
       temperature: 0.7,
     });
 
     const modifiedContent = prompt.choices[0]?.message?.content;
-    if(!modifiedContent){
-      return NextResponse.json({ error: "Failed to generate modified prompt." }, { status: 500 });
+    if (!modifiedContent) {
+      return NextResponse.json(
+        { error: "Failed to generate modified prompt." },
+        { status: 500 }
+      );
     }
 
     const modifiedMessages = [
@@ -73,7 +119,10 @@ export async function POST(req: NextRequest) {
       { ...lastMessage, content: prompt.choices[0].message.content },
     ];
 
-    logger.info("Creating completion...", { stream , messagesCount: modifiedMessages.length});
+    logger.info("Creating completion...", {
+      stream,
+      messagesCount: modifiedMessages.length,
+    });
 
     if (stream) {
       const completionStream = await gemini.chat.completions.create({
@@ -106,7 +155,7 @@ export async function POST(req: NextRequest) {
         headers: {
           "Content-Type": "text/event-stream",
           "Cache-Control": "no-cache",
-          "Connection": "keep-alive",
+          Connection: "keep-alive",
         },
       });
     } else {
@@ -125,14 +174,17 @@ export async function POST(req: NextRequest) {
   } catch (error) {
     logger.error("API error:", error);
 
-    if(error instanceof OpenAI.APIError){
+    if (error instanceof OpenAI.APIError) {
       return NextResponse.json(
         { error: `API Error: ${error.message}`, code: error.code },
-        { status : error.status || 500 }
+        { status: error.status || 500 }
       );
     }
     return NextResponse.json(
-      { error: "Internal server error", message: error instanceof Error ? error.message : "Unknown error" },
+      {
+        error: "Internal server error",
+        message: error instanceof Error ? error.message : "Unknown error",
+      },
       { status: 500 }
     );
   }
